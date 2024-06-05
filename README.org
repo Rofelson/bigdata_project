@@ -1,0 +1,129 @@
+#+title: Readme
+#+technologies: spark, hive, hdfs
+#+SETUPFILE: ~/.config/doom/setupfiles/jake-latex-standard.org
+
+
+* Project content
+Use Spark, Hive and HDFS for avocado.csv
+Give back powerpoint and pdf file in a folder with group name. Max of screenshots in both
+
+** Start containers
+Do ~podman-compose up -d~ to use the course compose file or ~./up.sh~
+
+* HDFS
+** Create HDFS repositories
+~/raw_avocado~, ~/staging_avocado~, ~/cleaned_avocado~
+- connect into the namenode with ~podman exec -it namenode bash~
+- create the folders in the hdfs file system using ~hdfs dfs -mkdir -p /raw_avocado /~
+  [[./1_hdfs_ls.png]]
+
+** Split avocado.csv in 5
+Use any tool and name ~avocado_n.csv~. Provided by M. Kra.
+
+** Load first one in ~"/raw_avocado"~
+We copy all the avocado files to the namenode container using ~podman cp avocado_1.csv namenode:/tmp/~ multiple times. Then we'll put avocado_1 into hdfs with ~hdfs -put /tmp/avocado_1.csv /raw_avocado/~.
+[[./2_hdfs_raw.png]]
+
+
+* Hive
+We'll get into the hive-server container using ~podman exec -it hive-server bash~
+** Create Hive bd TP_MASTER
+Connect to hive using ~beeline -u "jdbc:hive2://localhost:10000"~
+
+#+begin_src SQL
+CREATE DATABASE IF NOT EXISTS TP_MASTER;
+USE TP_MASTER;
+#+end_src
+
+** create internal table ~avocado_volume_tracking~
+Use two fields ~filename(str)~ and ~somme_volume(flt)~ from csv and latter sum volume
+table will be filled using pyspark
+| filename      | somme_volume |
+|---------------+--------------|
+| avocado_1.csv |      56000.5 |
+| avocado_2.csv |      40400.5 |
+
+#+begin_src SQL
+CREATE TABLE IF NOT EXISTS TP_MASTER.avocado_volume_tracking(
+        filename string,
+        somme_volume float
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY  ','
+COLLECTION ITEMS TERMINATED BY '\n'
+STORED AS TEXTFILE;
+#end_src
+
+[[./3_hive_tables.png]]
+* Spark
+all operations will be done in pyspark
+- Connect to spark using ~podman exec -it spark-master bash~.
+- Copy ~hive-site.xml~ to ~/spark/conf/~
+- Launch scripts using ~./spark-submit --master yarn --driver-memory 1g --executor-memory 1g --executor-cores 1 /partage/scripts/raw_pyspark.py~
+
+** Script to fill hive table from raw folder and move to staged folder
+Process raw_avocado
+
+#+begin_src python
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder.master("local[2]")
+    .appName("JOB RAW")
+    .enableHiveSupport()
+    .getOrCreate()
+)
+
+df = spark.read.options(header=True).format("csv").load("/raw_avocado").select("Volume", "_metadata")
+df = df.withColumn("Volume", df.Volume.cast("float"))
+file_paths = [v[0] for v in df.select("_metadata.file_path").distinct().collect()]
+# aggregate for table
+df2 = df.groupBy("_metadata.file_name").sum().withColumnRenamed("sum(Volume)", "somme_volume")
+# fill hive table
+df2.write.saveAsTable(name="tp_master.avocado_volume_tracking", mode="overwrite")
+# move files
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+for file in file_paths:
+    fs.rename(
+        spark._jvm.org.apache.hadoop.fs.Path(file),
+        spark._jvm.org.apache.hadoop.fs.Path(file.replace("/raw_","/staging_"))
+    )
+
+#+end_src
+
+[[./4_pyspark_df.png]]
+~enableHiveSupport~ is necessary to make pyspark work.
+The resilt will look somewhat like this:
+[[./5_hive_db.png]]
+** Script to add columns /jour/ and /mois/ extracted from /date/ from staged and move in clean forlder.
+Process staging_avocado
+
+#+begin_src python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import split
+
+spark = (
+    SparkSession.builder.master("local[2]")
+    .appName("JOB RAW")
+    .enableHiveSupport()
+    .getOrCreate()
+)
+df = spark.read.options(header=True).format("csv").load("/staging_avocado").select("*", "_metadata.file_path")
+file_paths = [v[0] for v in df.select("file_path").distinct().collect()]
+for file in file_paths:
+        df2 = df.filter(df.file_path==file)
+        split_date = split(df.Date,"-",-1)
+        df3 = df2.drop("file_path").withColumn("jour", split_date.getItem(2)).withColumn("mois", split_date.getItem(1))
+        # save new file in cleaned_avocado
+        df3.coalesce(1).write.csv(file.replace("raw_avocado/","cleaned_avocado/").replace("avocado_","avocado_cleaned_"))
+        # delete previous from staging_avocado
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+        fs.delete(spark._jvm.org.apache.hadoop.fs.Path(file), True)
+#end_src
+
+We use the split to make it work. The result will look somewhat like this:
+[[./6_hdfs_fs_cleaned.png]]
+Weird thing, pyspark can't natively create a named csv file. It uses the path we provide as a folder.
+* Redo
+** Move avocado_2 to raw and exec pyspark to check data
+Everything works as planned. Even with multiple file at the same time.
+** make same for remaining avocado_n files
